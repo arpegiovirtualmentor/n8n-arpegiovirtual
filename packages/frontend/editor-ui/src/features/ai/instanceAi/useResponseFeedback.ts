@@ -1,5 +1,6 @@
 import { ref, computed, type Ref } from 'vue';
 import { isSafeObjectKey } from '@n8n/api-types';
+import { redactTelemetryText } from '@n8n/telemetry';
 import type { InstanceAiMessage, InstanceAiAgentNode } from '@n8n/api-types';
 import type { RatingFeedback } from '@n8n/design-system';
 import type { ITelemetryTrackProperties } from 'n8n-workflow';
@@ -30,7 +31,7 @@ function hasPendingConfirmation(node: InstanceAiAgentNode): boolean {
 
 interface UseResponseFeedbackOptions {
 	messages: Ref<InstanceAiMessage[]>;
-	currentThreadId: Ref<string>;
+	threadId: string;
 	telemetry: { track: (event: string, props?: ITelemetryTrackProperties) => void };
 	/**
 	 * Optional remote callback invoked alongside telemetry to annotate the
@@ -46,7 +47,7 @@ interface UseResponseFeedbackOptions {
 
 export function useResponseFeedback({
 	messages,
-	currentThreadId,
+	threadId,
 	telemetry,
 	postFeedback,
 }: UseResponseFeedbackOptions) {
@@ -114,7 +115,7 @@ export function useResponseFeedback({
 
 		if (payload.rating) {
 			telemetry.track('User rated workflow generation', {
-				thread_id: currentThreadId.value,
+				thread_id: threadId,
 				response_id: responseId,
 				helpful: payload.rating === 'up',
 			});
@@ -126,9 +127,12 @@ export function useResponseFeedback({
 
 		if (payload.feedback !== undefined) {
 			telemetry.track('User submitted workflow generation feedback', {
-				thread_id: currentThreadId.value,
+				thread_id: threadId,
 				response_id: responseId,
-				feedback: payload.feedback,
+				// A free-text box the user types into, and this event goes to
+				// RudderStack *and* PostHog straight from the browser — no backend
+				// hop can scrub it.
+				feedback: redactTelemetryText(payload.feedback),
 			});
 
 			feedbackByResponseId.value[responseId] = {
@@ -147,7 +151,7 @@ export function useResponseFeedback({
 		if (postFeedback) {
 			const rating = payload.rating ?? ratingByResponseId.get(responseId);
 			if (rating) {
-				void postFeedback(currentThreadId.value, responseId, {
+				void postFeedback(threadId, responseId, {
 					rating,
 					...(payload.feedback !== undefined ? { comment: payload.feedback } : {}),
 				}).catch(() => {

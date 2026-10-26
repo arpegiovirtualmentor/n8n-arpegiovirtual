@@ -2,16 +2,26 @@ import { GlobalConfig } from '@n8n/config';
 import { DbConnection } from '@n8n/db';
 import { Container } from '@n8n/di';
 import type express from 'express';
-import { mock } from 'jest-mock-extended';
 import type * as http from 'node:http';
+import { mock } from 'vitest-mock-extended';
 
 import { AbstractServer } from '@/abstract-server';
 import { ExternalHooks } from '@/external-hooks';
+import { LiveWebhooks } from '@/webhooks/live-webhooks';
+import { SlackInteractionWebhooks } from '@/webhooks/slack-interaction-webhooks';
+import { TelegramInteractionWebhooks } from '@/webhooks/telegram-interaction-webhooks';
+import { WaitingForms } from '@/webhooks/waiting-forms';
+import { WaitingWebhooks } from '@/webhooks/waiting-webhooks';
+import { createWebhookHandlerFor } from '@/webhooks/webhook-request-handler';
+
+vi.mock('@/webhooks/webhook-request-handler', () => ({
+	createWebhookHandlerFor: vi.fn(),
+}));
 
 const mockServer = mock<http.Server>();
 
-jest.mock('http', () => ({
-	...jest.requireActual('http'),
+vi.mock('http', async () => ({
+	...(await vi.importActual<typeof import('http')>('http')),
 	createServer: () => mockServer,
 }));
 
@@ -19,7 +29,7 @@ const mockApp = mock<express.Application>();
 mockApp.get.mockReturnValue(mockApp);
 mockApp.use.mockReturnValue(mockApp);
 
-jest.mock('express', () => ({ __esModule: true, default: () => mockApp }));
+vi.mock('express', async () => ({ __esModule: true, default: () => mockApp }));
 
 class TestServer extends AbstractServer {
 	async configure() {}
@@ -32,7 +42,7 @@ describe('AbstractServer health endpoints', () => {
 	let dbConnection: DbConnection;
 
 	beforeEach(async () => {
-		jest.restoreAllMocks();
+		vi.restoreAllMocks();
 
 		mockServer.listen.mockImplementation((...args: unknown[]) => {
 			const callback = args.find((arg) => typeof arg === 'function');
@@ -85,6 +95,21 @@ describe('AbstractServer health endpoints', () => {
 
 		testServer = new TestServer();
 		await testServer.init();
+	});
+
+	describe('webhook route registration', () => {
+		it('should register the waiting-forms route with the form sandbox family', async () => {
+			const waitingForms = mock<WaitingForms>();
+			Container.set(LiveWebhooks, mock<LiveWebhooks>());
+			Container.set(WaitingForms, waitingForms);
+			Container.set(WaitingWebhooks, mock<WaitingWebhooks>());
+			Container.set(SlackInteractionWebhooks, mock<SlackInteractionWebhooks>());
+			Container.set(TelegramInteractionWebhooks, mock<TelegramInteractionWebhooks>());
+
+			await testServer.start();
+
+			expect(createWebhookHandlerFor).toHaveBeenCalledWith(waitingForms, undefined, 'form');
+		});
 	});
 
 	describe('/healthz (liveness)', () => {

@@ -4,18 +4,19 @@ import { SupportedProtocols, useSSOStore } from '../sso.store';
 import { useI18n } from '@n8n/i18n';
 import { captureMessage } from '@sentry/vue';
 
-import { N8nButton, N8nInput, N8nOption, N8nRadioButtons, N8nSelect } from '@n8n/design-system';
-import { useClipboard } from '@/app/composables/useClipboard';
-import { useToast } from '@/app/composables/useToast';
+import { N8nButton, N8nInput, N8nOption, N8nSegmentControl, N8nSelect } from '@n8n/design-system';
+import { useClipboard } from '@n8n/composables/useClipboard';
+import { useToast } from '@n8n/composables/useToast';
 import { useMessage } from '@/app/composables/useMessage';
 import { computed, onMounted, ref } from 'vue';
 import UserRoleProvisioningDropdown from '../provisioning/components/UserRoleProvisioningDropdown.vue';
 import { useUserRoleProvisioningForm } from '../provisioning/composables/useUserRoleProvisioningForm';
 import { useRootStore } from '@n8n/stores/useRootStore';
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
 import ConfirmProvisioningDialog from '../provisioning/components/ConfirmProvisioningDialog.vue';
 import RoleMappingRuleEditor from '../provisioning/components/RoleMappingRuleEditor.vue';
 import { MODAL_CONFIRM } from '@/app/constants/modals';
+import { openSafeUrl } from '@/app/utils/htmlUtils';
 
 const i18n = useI18n();
 const ssoStore = useSSOStore();
@@ -38,6 +39,7 @@ async function handleCopy(value: string, field: string) {
 }
 
 const isSsoManagedByEnv = computed(() => ssoStore.ssoManagedByEnv);
+const isRulesMappingInN8n = computed(() => mappingMethod.value === 'rules_in_n8n');
 
 const savingForm = ref<boolean>(false);
 const roleMappingRuleEditorRef = ref<InstanceType<typeof RoleMappingRuleEditor> | null>(null);
@@ -72,9 +74,10 @@ const showUserRoleProvisioningDialog = ref(false);
 const {
 	roleAssignment,
 	mappingMethod,
-	formValue: userRoleProvisioning,
+	defaultInstanceRole,
 	isUserRoleProvisioningChanged,
 	saveProvisioningConfig,
+	trackProvisioningChange,
 	roleAssignmentTransition,
 	storedHasProjectRoles,
 	isDroppingProjectRules,
@@ -203,6 +206,24 @@ const prompTestSamlConnectionBeforeActivating = async () => {
 };
 
 const onSave = async (provisioningChangesConfirmed: boolean = false): Promise<boolean> => {
+	if (isSsoManagedByEnv.value) {
+		try {
+			savingForm.value = true;
+			const ruleSaveResult = await roleMappingRuleEditorRef.value?.save();
+			trackProvisioningChange({ configChanged: false }, ruleSaveResult);
+			toast.showMessage({
+				title: i18n.baseText('settings.sso.settings.save.success'),
+				type: 'success',
+			});
+			return true;
+		} catch (error) {
+			toast.showError(error, i18n.baseText('settings.sso.settings.save.error'));
+			return false;
+		} finally {
+			savingForm.value = false;
+		}
+	}
+
 	try {
 		savingForm.value = true;
 		validateSamlInput();
@@ -245,7 +266,7 @@ const onSave = async (provisioningChangesConfirmed: boolean = false): Promise<bo
 			loginEnabled: samlLoginEnabled.value,
 		});
 
-		await saveProvisioningConfig(isDisablingSamlLogin);
+		const provisioningResult = await saveProvisioningConfig(isDisablingSamlLogin);
 
 		// If the user's effective role assignment doesn't include project roles,
 		// discard any project-rule state in the editor (both locally-added and
@@ -257,9 +278,12 @@ const onSave = async (provisioningChangesConfirmed: boolean = false): Promise<bo
 			roleMappingRuleEditorRef.value?.discardProjectRules();
 		}
 
-		if (userRoleProvisioning.value === 'expression_based') {
-			await roleMappingRuleEditorRef.value?.save();
-		}
+		const ruleSaveResult =
+			mappingMethod.value === 'rules_in_n8n'
+				? await roleMappingRuleEditorRef.value?.save()
+				: undefined;
+
+		trackProvisioningChange(provisioningResult, ruleSaveResult);
 
 		// Update store with saved protocol selection
 		ssoStore.selectedAuthProtocol = SupportedProtocols.SAML;
@@ -288,7 +312,7 @@ const onTest = async () => {
 		const url = await ssoStore.testSamlConfig(metaDataConfig);
 
 		if (typeof window !== 'undefined') {
-			window.open(url, '_blank');
+			openSafeUrl(url);
 		}
 	} catch (error) {
 		toast.showError(error, 'error');
@@ -314,7 +338,9 @@ const validateSamlInput = () => {
 	}
 };
 
-const hasUnsavedChanges = computed(() => isSaveEnabled.value && !isSsoManagedByEnv.value);
+const hasUnsavedChanges = computed(
+	() => isSaveEnabled.value && (!isSsoManagedByEnv.value || isRulesMappingInN8n.value),
+);
 
 defineExpose({ hasUnsavedChanges, onSave });
 
@@ -338,7 +364,7 @@ onMounted(async () => {
 						</div>
 						<div :class="$style.copyButtonWrapper">
 							<N8nButton
-								variant="subtle"
+								variant="outline"
 								icon-only
 								:icon="redirectUrlCopied ? 'check' : 'copy'"
 								@click="handleCopy(redirectUrl, 'redirectUrl')"
@@ -359,7 +385,7 @@ onMounted(async () => {
 						</div>
 						<div :class="$style.copyButtonWrapper">
 							<N8nButton
-								variant="subtle"
+								variant="outline"
 								icon-only
 								:icon="entityIdCopied ? 'check' : 'copy'"
 								@click="handleCopy(entityId, 'entityId')"
@@ -374,7 +400,7 @@ onMounted(async () => {
 						<label>{{ i18n.baseText('settings.sso.settings.ips.label') }}</label>
 					</div>
 					<div :class="$style.settingsItemControl">
-						<N8nRadioButtons
+						<N8nSegmentControl
 							v-model="ipsType"
 							:disabled="isSsoManagedByEnv"
 							:options="ipsOptions"
@@ -411,13 +437,14 @@ onMounted(async () => {
 			<UserRoleProvisioningDropdown
 				v-model:role-assignment="roleAssignment"
 				v-model:mapping-method="mappingMethod"
-				v-model:legacy-value="userRoleProvisioning"
+				v-model:default-instance-role="defaultInstanceRole"
 				:disabled="isSsoManagedByEnv"
 				auth-protocol="saml"
 			/>
 			<RoleMappingRuleEditor
 				v-if="mappingMethod === 'rules_in_n8n'"
 				ref="roleMappingRuleEditorRef"
+				v-model:default-instance-role="defaultInstanceRole"
 				:show-project-rules="roleAssignment === 'instance_and_project'"
 			/>
 			<ConfirmProvisioningDialog
@@ -466,7 +493,7 @@ onMounted(async () => {
 
 		<div :class="$style.buttons">
 			<N8nButton
-				v-if="!isSsoManagedByEnv"
+				v-if="!isSsoManagedByEnv || isRulesMappingInN8n"
 				:disabled="!isSaveEnabled"
 				:loading="savingForm"
 				size="large"
@@ -476,7 +503,7 @@ onMounted(async () => {
 				{{ i18n.baseText('settings.sso.settings.save') }}
 			</N8nButton>
 			<N8nButton
-				variant="subtle"
+				variant="outline"
 				:disabled="!isTestEnabled"
 				size="large"
 				data-test-id="sso-test"

@@ -1,4 +1,4 @@
-import { inTest, inDevelopment, Logger } from '@n8n/backend-common';
+import { inDevelopment, inTest, Logger } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
 import { DbConnection } from '@n8n/db';
 import { OnShutdown } from '@n8n/decorators';
@@ -8,23 +8,34 @@ import express from 'express';
 import { readFile } from 'fs/promises';
 import type { Server } from 'http';
 import isbot from 'isbot';
+import { SLACK_HITL_WEBHOOK_SUFFIX, TELEGRAM_HITL_WEBHOOK_SUFFIX } from 'n8n-core';
 
 import config from '@/config';
 import { N8N_VERSION, TEMPLATES_DIR } from '@/constants';
-import { ServiceUnavailableError } from '@/errors/response-errors/service-unavailable.error';
+import { ServiceUnavailableError } from '@n8n/errors';
 import { ExternalHooks } from '@/external-hooks';
-import { rawBodyReader, bodyParser, corsMiddleware } from '@/middlewares';
-import { send, sendErrorResponse } from '@/response-helper';
+import { bodyParser, corsMiddleware, rawBodyReader } from '@/middlewares';
+import { sendErrorResponse } from '@/response-helper';
+import { DatabaseIndependentRoutes } from '@/services/database-independent-routes.service';
 import { createHandlebarsEngine } from '@/utils/handlebars.util';
-import { resolveBackendHealthEndpointPath } from '@/utils/health-endpoint.util';
 import { LiveWebhooks } from '@/webhooks/live-webhooks';
+import { SlackInteractionWebhooks } from '@/webhooks/slack-interaction-webhooks';
+import { TelegramInteractionWebhooks } from '@/webhooks/telegram-interaction-webhooks';
 import { TestWebhooks } from '@/webhooks/test-webhooks';
 import { WaitingForms } from '@/webhooks/waiting-forms';
 import { WaitingWebhooks } from '@/webhooks/waiting-webhooks';
 import { createWebhookHandlerFor } from '@/webhooks/webhook-request-handler';
 
+import { resolveBackendHealthEndpointPath } from './utils/health-endpoint.util';
+
 @Service()
 export abstract class AbstractServer {
+	/**
+	 * Path patterns that allow bot user agents through the bot filter.
+	 * Populated by ControllerRegistry when routes with { allowBots: true } are registered.
+	 */
+	static readonly botAllowedPaths: string[] = [];
+
 	protected logger: Logger;
 
 	protected server: Server;
@@ -36,6 +47,8 @@ export abstract class AbstractServer {
 	protected globalConfig = Container.get(GlobalConfig);
 
 	protected dbConnection = Container.get(DbConnection);
+
+	private databaseIndependentRoutes = Container.get(DatabaseIndependentRoutes);
 
 	protected sslKey: string;
 
@@ -66,8 +79,6 @@ export abstract class AbstractServer {
 	protected testWebhooksEnabled = false;
 
 	private fullyReady = false;
-
-	readonly uniqueInstanceId: string;
 
 	constructor() {
 		this.app = express();
@@ -155,12 +166,24 @@ export abstract class AbstractServer {
 			}
 		});
 
-		this.app.use((_req, res, next) => {
+		this.app.use((req, res, next) => {
+			if (this.isServedWithoutDatabase(req)) {
+				next();
+				return;
+			}
 			if (connectionState.connected) {
 				if (connectionState.migrated) next();
 				else res.send('n8n is starting up. Please wait');
 			} else sendErrorResponse(res, new ServiceUnavailableError('Database is not ready!'));
 		});
+	}
+
+	private isServedWithoutDatabase(req: express.Request) {
+		return (
+			this.dbConnection.connectionState.migrated &&
+			(req.method === 'GET' || req.method === 'HEAD') &&
+			this.databaseIndependentRoutes.has(req.path)
+		);
 	}
 
 	async init(): Promise<void> {
@@ -243,16 +266,32 @@ export abstract class AbstractServer {
 				createWebhookHandlerFor(liveWebhooks, 'webhook'),
 			);
 
-			// Register a handler for waiting forms
+			// Register a handler for waiting forms (excluded from metrics to avoid double-counting)
 			this.app.all(
 				`/${this.endpointFormWaiting}/:path{/:suffix}`,
-				createWebhookHandlerFor(Container.get(WaitingForms)),
+				createWebhookHandlerFor(Container.get(WaitingForms), undefined, 'form'),
 			);
 
-			// Register a handler for waiting webhooks
+			// Register a handler for waiting webhooks (excluded from metrics to avoid double-counting)
 			this.app.all(
 				`/${this.endpointWebhookWaiting}/:path{/:suffix}`,
 				createWebhookHandlerFor(Container.get(WaitingWebhooks)),
+			);
+
+			// Slack posts all button clicks to one fixed URL, so the ids travel in the button
+			// value instead of the path.
+			this.app.all(
+				`/${this.endpointWebhookWaiting}${SLACK_HITL_WEBHOOK_SUFFIX}`,
+				createWebhookHandlerFor(Container.get(SlackInteractionWebhooks)),
+			);
+
+			// Register a handler for Telegram HITL callback-button taps. Fixed path (no
+			// per-execution suffix): the reference travels inside the Telegram update body
+			// instead of the URL, since Telegram delivers every registered bot's updates to
+			// one fixed webhook URL.
+			this.app.all(
+				`/${this.endpointWebhookWaiting}${TELEGRAM_HITL_WEBHOOK_SUFFIX}`,
+				createWebhookHandlerFor(Container.get(TelegramInteractionWebhooks)),
 			);
 
 			// Register a handler for live MCP servers
@@ -275,11 +314,21 @@ export abstract class AbstractServer {
 			this.app.all(`/${this.endpointMcpTest}/*path`, createWebhookHandlerFor(testWebhooks, 'mcp'));
 		}
 
-		// Block bots from scanning the application
+		// Block bots from scanning the application.
+		// Routes with { allowBots: true } are registered in botAllowedPaths
+		// by the ControllerRegistry and exempted from this filter.
 		const checkIfBot = isbot.spawn(['bot']);
 		this.app.use((req, res, next) => {
 			const userAgent = req.headers['user-agent'];
 			if (userAgent && checkIfBot(userAgent)) {
+				// Check if this path matches a route with { allowBots: true }
+				const allowed = AbstractServer.botAllowedPaths.some((pattern) =>
+					new RegExp(`^${pattern}$`).test(req.path),
+				);
+				if (allowed) {
+					next();
+					return;
+				}
 				this.logger.info(`Blocked ${req.method} ${req.url} for "${userAgent}"`);
 				res.status(204).end();
 			} else next();
@@ -287,16 +336,6 @@ export abstract class AbstractServer {
 
 		if (inDevelopment) {
 			this.setupDevMiddlewares();
-		}
-
-		if (this.testWebhooksEnabled) {
-			const testWebhooks = Container.get(TestWebhooks);
-			// Removes a test webhook
-			// TODO UM: check if this needs validation with user management.
-			this.app.delete(
-				`/${this.restEndpoint}/test-webhook/:id`,
-				send(async (req) => await testWebhooks.cancelWebhook(req.params.id)),
-			);
 		}
 
 		// Setup body parsing middleware after the webhook handlers are setup

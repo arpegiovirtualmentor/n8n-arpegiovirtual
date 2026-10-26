@@ -33,7 +33,8 @@ function getAnswers(): DisplayAnswer[] {
 		}
 		const parts: string[] = [];
 		if (Array.isArray(a.selectedOptions) && a.selectedOptions.length > 0) {
-			parts.push((a.selectedOptions as string[]).join(', '));
+			// The first line of an option is its title; a description line stays in the card.
+			parts.push((a.selectedOptions as string[]).map((o) => o.split('\n')[0]).join(', '));
 		}
 		if (typeof a.customText === 'string' && a.customText.trim()) {
 			parts.push(a.customText.trim());
@@ -65,11 +66,11 @@ function getAnswers(): DisplayAnswer[] {
 .wrapper {
 	display: flex;
 	justify-content: flex-end;
-	margin-bottom: var(--spacing--xs);
+	margin-block: var(--spacing--lg);
 }
 
 .userBubble {
-	background: var(--color--background);
+	background: var(--assistant--color--background--user-bubble);
 	padding: var(--spacing--xs) var(--spacing--sm) var(--spacing--sm);
 	border-radius: var(--radius--xl);
 	white-space: pre-wrap;
@@ -92,7 +93,7 @@ function getAnswers(): DisplayAnswer[] {
 }
 
 .skipped {
-	color: var(--color--text--tint-2);
+	color: var(--text-color);
 	font-style: italic;
 }
 </style>

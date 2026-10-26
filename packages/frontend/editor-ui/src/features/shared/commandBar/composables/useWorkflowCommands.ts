@@ -9,8 +9,7 @@ import { useTagsStore } from '@/features/shared/tags/tags.store';
 import { useUIStore } from '@/app/stores/ui.store';
 import { useSourceControlStore } from '@/features/integrations/sourceControl.ee/sourceControl.store';
 import { useCollaborationStore } from '@/features/collaboration/collaboration/collaboration.store';
-import { useCanvasOperations } from '@/app/composables/useCanvasOperations';
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
 import { useRunWorkflow } from '@/app/composables/useRunWorkflow';
 import {
 	DUPLICATE_MODAL_KEY,
@@ -23,14 +22,10 @@ import { canvasEventBus } from '@/features/workflows/canvas/canvas.eventBus';
 import type { IWorkflowToShare } from '@/Interface';
 import { saveAs } from 'file-saver';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
-import {
-	useWorkflowDocumentStore,
-	createWorkflowDocumentId,
-} from '@/app/stores/workflowDocument.store';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 import type { CommandGroup, CommandBarItem } from '../types';
 import uniqBy from 'lodash/uniqBy';
 import { nodeViewEventBus } from '@/app/event-bus';
-import CommandBarItemTitle from '@/features/shared/commandBar/components/CommandBarItemTitle.vue';
 
 const ITEM_ID = {
 	OPEN_CREDENTIAL: 'open-credential',
@@ -54,7 +49,6 @@ const ITEM_ID = {
 
 export function useWorkflowCommands(): CommandGroup {
 	const i18n = useI18n();
-	const { editableWorkflow } = useCanvasOperations();
 	const rootStore = useRootStore();
 	const uiStore = useUIStore();
 	const tagsStore = useTagsStore();
@@ -62,9 +56,7 @@ export function useWorkflowCommands(): CommandGroup {
 	const sourceControlStore = useSourceControlStore();
 	const collaborationStore = useCollaborationStore();
 
-	const workflowDocumentStore = computed(() =>
-		useWorkflowDocumentStore(createWorkflowDocumentId(workflowsStore.workflowId)),
-	);
+	const workflowDocumentStore = injectWorkflowDocumentStore();
 
 	const router = useRouter();
 
@@ -87,7 +79,9 @@ export function useWorkflowCommands(): CommandGroup {
 
 	const credentialCommands = computed<CommandBarItem[]>(() => {
 		const credentials = uniqBy(
-			editableWorkflow.value.nodes.map((node) => Object.values(node.credentials ?? {})).flat(),
+			workflowDocumentStore.value.allNodes
+				.map((node) => Object.values(node.credentials ?? {}))
+				.flat(),
 			(cred) => cred.id,
 		);
 		if (credentials.length === 0) {
@@ -152,15 +146,10 @@ export function useWorkflowCommands(): CommandGroup {
 					},
 					{
 						id: ITEM_ID.TEST_WORKFLOW,
-						title: {
-							component: CommandBarItemTitle,
-							props: {
-								title: i18n.baseText('commandBar.workflow.test'),
-								shortcut: {
-									metaKey: true,
-									keys: ['enter'],
-								},
-							},
+						title: i18n.baseText('commandBar.workflow.test'),
+						shortcut: {
+							metaKey: true,
+							keys: ['enter'],
 						},
 						section: i18n.baseText('commandBar.sections.workflow'),
 						keywords: [
@@ -182,16 +171,11 @@ export function useWorkflowCommands(): CommandGroup {
 					},
 					{
 						id: ITEM_ID.TIDY_UP_WORKFLOW,
-						title: {
-							component: CommandBarItemTitle,
-							props: {
-								title: i18n.baseText('commandBar.workflow.tidyUp'),
-								shortcut: {
-									shiftKey: true,
-									altKey: true,
-									keys: ['t'],
-								},
-							},
+						title: i18n.baseText('commandBar.workflow.tidyUp'),
+						shortcut: {
+							shiftKey: true,
+							altKey: true,
+							keys: ['t'],
 						},
 						keywords: [i18n.baseText('commandBar.workflow.tidyUp')],
 						section: i18n.baseText('commandBar.sections.workflow'),
@@ -239,15 +223,10 @@ export function useWorkflowCommands(): CommandGroup {
 			: []),
 		{
 			id: ITEM_ID.SELECT_ALL,
-			title: {
-				component: CommandBarItemTitle,
-				props: {
-					title: i18n.baseText('commandBar.workflow.selectAll'),
-					shortcut: {
-						metaKey: true,
-						keys: ['a'],
-					},
-				},
+			title: i18n.baseText('commandBar.workflow.selectAll'),
+			shortcut: {
+				metaKey: true,
+				keys: ['a'],
 			},
 			section: i18n.baseText('commandBar.sections.workflow'),
 			keywords: [i18n.baseText('commandBar.workflow.selectAll')],
@@ -286,8 +265,10 @@ export function useWorkflowCommands(): CommandGroup {
 								name: DUPLICATE_MODAL_KEY,
 								data: {
 									id: workflowsStore.workflowId,
-									name: editableWorkflow.value.name,
-									tags: editableWorkflow.value.tags,
+									name: workflowDocumentStore.value.name,
+									tags: workflowDocumentStore.value.tags,
+									// Place the copy in the source workflow's folder
+									parentFolderId: workflowDocumentStore.value.parentFolder?.id,
 								},
 							});
 						},
@@ -303,7 +284,7 @@ export function useWorkflowCommands(): CommandGroup {
 	]);
 
 	const subworkflowCommands = computed<CommandBarItem[]>(() => {
-		const subworkflows = editableWorkflow.value.nodes
+		const subworkflows = workflowDocumentStore.value.allNodes
 			.filter((node) => node.type === EXECUTE_WORKFLOW_NODE_TYPE)
 			.map((node) => node?.parameters?.workflowId)
 			.filter(
@@ -328,7 +309,7 @@ export function useWorkflowCommands(): CommandGroup {
 						handler: () => {
 							const { href } = router.resolve({
 								name: VIEWS.WORKFLOW,
-								params: { name: workflow.id },
+								params: { workflowId: workflow.id },
 							});
 							window.open(href, '_blank', 'noreferrer');
 						},
@@ -366,7 +347,7 @@ export function useWorkflowCommands(): CommandGroup {
 					const blob = new Blob([JSON.stringify(exportData, null, 2)], {
 						type: 'application/json;charset=utf-8',
 					});
-					let name = editableWorkflow.value.name || 'unsaved_workflow';
+					let name = workflowDocumentStore.value.name || 'unsaved_workflow';
 					name = name.replace(/[^a-z0-9]/gi, '_');
 					telemetry.track('User exported workflow', { workflow_id: workflowData.id });
 					saveAs(blob, name + '.json');
@@ -374,7 +355,7 @@ export function useWorkflowCommands(): CommandGroup {
 				icon: {
 					component: N8nIcon,
 					props: {
-						icon: 'download',
+						icon: 'arrow-block-up',
 					},
 				},
 				keywords: [
@@ -412,7 +393,7 @@ export function useWorkflowCommands(): CommandGroup {
 				icon: {
 					component: N8nIcon,
 					props: {
-						icon: 'file-import',
+						icon: 'arrow-block-down',
 					},
 				},
 				handler: () => {

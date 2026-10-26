@@ -19,7 +19,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import type { IConnection, NodeConnectionType } from 'n8n-workflow';
 import { NodeConnectionTypes } from 'n8n-workflow';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
 import { createTestNode } from '@/__tests__/mocks';
 import type { INodeUi } from '@/Interface';
 import {
@@ -60,15 +59,11 @@ function createConnectionData(
 }
 
 describe('useWorkflowDocumentConnections', () => {
-	let workflowsStore: ReturnType<typeof useWorkflowsStore>;
 	let deps: WorkflowDocumentConnectionsDeps;
 
 	beforeEach(() => {
 		setActivePinia(createPinia());
-		workflowsStore = useWorkflowsStore();
 		deps = createDeps();
-
-		workflowsStore.workflow.connections = {};
 	});
 
 	describe('round-trip: setConnections → read', () => {
@@ -134,6 +129,16 @@ describe('useWorkflowDocumentConnections', () => {
 	});
 
 	describe('round-trip: addConnection → read', () => {
+		it('hasConnection identifies an existing connection', () => {
+			const composable = useWorkflowDocumentConnections(deps);
+			const connectionData = createConnectionData('A', 'B');
+
+			expect(composable.hasConnection(connectionData)).toBe(false);
+			composable.addConnection(connectionData);
+			expect(composable.hasConnection(connectionData)).toBe(true);
+			expect(composable.hasConnection(createConnectionData('A', 'C'))).toBe(false);
+		});
+
 		it('connection added via addConnection is readable via connectionsBySourceNode', () => {
 			const composable = useWorkflowDocumentConnections(deps);
 			composable.addConnection(createConnectionData('A', 'B'));
@@ -342,6 +347,24 @@ describe('useWorkflowDocumentConnections', () => {
 			composable.addConnection(createConnectionData('A', 'B'));
 
 			expect(dirtySpy).toHaveBeenCalledOnce();
+		});
+
+		it('addConnection does not fire events for a duplicate connection', () => {
+			const hookSpy = vi.fn();
+			const dirtySpy = vi.fn();
+			const connectionData = createConnectionData('A', 'B');
+
+			const composable = useWorkflowDocumentConnections(deps);
+			composable.onConnectionsChange(hookSpy);
+			composable.onStateDirty(dirtySpy);
+			composable.addConnection(connectionData);
+			hookSpy.mockClear();
+			dirtySpy.mockClear();
+
+			composable.addConnection(connectionData);
+
+			expect(hookSpy).not.toHaveBeenCalled();
+			expect(dirtySpy).not.toHaveBeenCalled();
 		});
 
 		it('removeConnection fires onConnectionsChange with DELETE action', () => {

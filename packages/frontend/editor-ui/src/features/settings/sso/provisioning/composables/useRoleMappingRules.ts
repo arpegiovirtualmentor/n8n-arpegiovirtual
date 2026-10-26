@@ -1,9 +1,16 @@
-import { computed, ref, watch } from 'vue';
+import { computed, ref } from 'vue';
 import type {
 	RoleMappingRuleResponse,
 	RoleMappingRuleType,
 } from '@n8n/rest-api-client/api/roleMappingRule';
 import { useRoleMappingRulesApi } from './useRoleMappingRulesApi';
+
+export type RoleMappingRulesSaveResult = {
+	createdCount: number;
+	deletedCount: number;
+	instanceRuleCount: number;
+	projectRuleCount: number;
+};
 
 function generateLocalId(): string {
 	return `local-${crypto.randomUUID()}`;
@@ -28,20 +35,11 @@ export function useRoleMappingRules() {
 
 	const instanceRules = ref<RoleMappingRuleResponse[]>([]);
 	const projectRules = ref<RoleMappingRuleResponse[]>([]);
-	const fallbackInstanceRole = ref<string>('global:member');
 	const isLoading = ref(false);
 	const isDirty = ref(false);
 
 	let serverRuleIds = new Set<string>();
 	let serverProjectRuleIds = new Set<string>();
-
-	let fallbackInitialized = false;
-	watch(fallbackInstanceRole, () => {
-		if (fallbackInitialized) {
-			isDirty.value = true;
-		}
-		fallbackInitialized = true;
-	});
 
 	function getRulesRef(type: RoleMappingRuleType) {
 		return type === 'instance' ? instanceRules : projectRules;
@@ -127,7 +125,7 @@ export function useRoleMappingRules() {
 		serverProjectRuleIds = new Set();
 	}
 
-	async function save() {
+	async function save(): Promise<RoleMappingRulesSaveResult> {
 		isLoading.value = true;
 		try {
 			// Defensive re-sync: the server may have removed rules between the
@@ -173,6 +171,13 @@ export function useRoleMappingRules() {
 			}
 
 			await loadRules();
+
+			return {
+				createdCount: createRules.length,
+				deletedCount: deleteIds.length,
+				instanceRuleCount: instanceRules.value.length,
+				projectRuleCount: projectRules.value.length,
+			};
 		} finally {
 			isLoading.value = false;
 		}
@@ -181,7 +186,6 @@ export function useRoleMappingRules() {
 	return {
 		instanceRules,
 		projectRules,
-		fallbackInstanceRole,
 		isLoading: computed(() => isLoading.value),
 		isDirty: computed(() => isDirty.value),
 		addRule,

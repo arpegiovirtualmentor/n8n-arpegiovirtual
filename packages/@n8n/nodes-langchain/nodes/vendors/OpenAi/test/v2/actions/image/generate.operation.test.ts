@@ -1,15 +1,25 @@
-import { mock, mockDeep } from 'jest-mock-extended';
+import { mock, mockDeep } from 'vitest-mock-extended';
 import type { IExecuteFunctions, INode } from 'n8n-workflow';
 
 import * as transport from '../../../../transport';
 import { execute } from '../../../../v2/actions/image/generate.operation';
+import type { Mocked } from 'vitest';
 
-jest.mock('../../../../transport');
+vi.mock('../../../../transport');
+
+const { accumulateTokenUsageMock } = vi.hoisted(() => ({
+	accumulateTokenUsageMock: vi.fn(),
+}));
+
+vi.mock('n8n-workflow', async (importOriginal) => ({
+	...(await importOriginal<typeof import('n8n-workflow')>()),
+	accumulateTokenUsage: accumulateTokenUsageMock,
+}));
 
 describe('Image Generate Operation', () => {
-	let mockExecuteFunctions: jest.Mocked<IExecuteFunctions>;
+	let mockExecuteFunctions: Mocked<IExecuteFunctions>;
 	let mockNode: INode;
-	const apiRequestSpy = jest.spyOn(transport, 'apiRequest');
+	const apiRequestSpy = vi.spyOn(transport, 'apiRequest');
 
 	const makeNode = (typeVersion: number): INode =>
 		mock<INode>({
@@ -33,11 +43,40 @@ describe('Image Generate Operation', () => {
 
 	beforeEach(() => {
 		mockExecuteFunctions = mockDeep<IExecuteFunctions>();
-		mockExecuteFunctions.helpers.prepareBinaryData = jest.fn().mockResolvedValue(mockBinaryData);
+		mockExecuteFunctions.helpers.prepareBinaryData = vi.fn().mockResolvedValue(mockBinaryData);
 	});
 
 	afterEach(() => {
-		jest.resetAllMocks();
+		vi.resetAllMocks();
+	});
+
+	describe('empty prompt validation', () => {
+		beforeEach(() => {
+			mockNode = makeNode(2.2);
+			mockExecuteFunctions.getNode.mockReturnValue(mockNode);
+		});
+
+		it('should throw error for empty prompt', async () => {
+			mockExecuteFunctions.getNodeParameter.mockImplementation((paramName: string) => {
+				const params = { model: 'dall-e-3', prompt: '', options: {} };
+				return params[paramName as keyof typeof params];
+			});
+
+			await expect(execute.call(mockExecuteFunctions, 0)).rejects.toThrow(
+				'A non-empty prompt is required.',
+			);
+		});
+
+		it('should throw error for whitespace-only prompt', async () => {
+			mockExecuteFunctions.getNodeParameter.mockImplementation((paramName: string) => {
+				const params = { model: 'dall-e-3', prompt: '   ', options: {} };
+				return params[paramName as keyof typeof params];
+			});
+
+			await expect(execute.call(mockExecuteFunctions, 0)).rejects.toThrow(
+				'A non-empty prompt is required.',
+			);
+		});
 	});
 
 	describe('v2.1 (static model field)', () => {
@@ -232,6 +271,62 @@ describe('Image Generate Operation', () => {
 					body: expect.not.objectContaining({ dalleQuality: expect.anything() }),
 				}),
 			);
+		});
+	});
+
+	describe('token usage reporting', () => {
+		beforeEach(() => {
+			mockNode = makeNode(2.2);
+			mockExecuteFunctions.getNode.mockReturnValue(mockNode);
+			mockExecuteFunctions.getNodeParameter.mockImplementation(
+				(paramName: string, _i: unknown, _default: unknown, opts?: { extractValue?: boolean }) => {
+					if (paramName === 'modelId' && opts?.extractValue) return 'gpt-image-1';
+					const params = { prompt: 'a cute cat', options: {} };
+					return params[paramName as keyof typeof params];
+				},
+			);
+		});
+
+		it('should report token usage when the API returns a usage object', async () => {
+			apiRequestSpy.mockResolvedValue({
+				...b64Response,
+				usage: { input_tokens: 42, output_tokens: 1568, total_tokens: 1610 },
+			});
+
+			await execute.call(mockExecuteFunctions, 0);
+
+			expect(accumulateTokenUsageMock).toHaveBeenCalledTimes(1);
+			expect(accumulateTokenUsageMock).toHaveBeenCalledWith(mockExecuteFunctions, 42, 1568);
+		});
+
+		it('should not report token usage when the API omits it, and still return the image', async () => {
+			apiRequestSpy.mockResolvedValue(b64Response);
+
+			const result = await execute.call(mockExecuteFunctions, 0);
+
+			expect(accumulateTokenUsageMock).not.toHaveBeenCalled();
+			expect(result).toEqual([
+				{
+					json: expect.objectContaining({ data: undefined }),
+					binary: { data: mockBinaryData },
+					pairedItem: { item: 0 },
+				},
+			]);
+		});
+
+		it('should not report token usage when a proxy returns usage without the counts', async () => {
+			apiRequestSpy.mockResolvedValue({ ...b64Response, usage: { total_tokens: 1610 } });
+
+			const result = await execute.call(mockExecuteFunctions, 0);
+
+			expect(accumulateTokenUsageMock).not.toHaveBeenCalled();
+			expect(result).toEqual([
+				{
+					json: expect.objectContaining({ data: undefined }),
+					binary: { data: mockBinaryData },
+					pairedItem: { item: 0 },
+				},
+			]);
 		});
 	});
 });

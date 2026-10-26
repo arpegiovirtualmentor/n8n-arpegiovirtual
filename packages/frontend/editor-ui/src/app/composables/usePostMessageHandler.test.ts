@@ -3,9 +3,13 @@ import { shallowRef } from 'vue';
 import { setActivePinia } from 'pinia';
 import { createTestingPinia } from '@pinia/testing';
 import { jsonParse } from 'n8n-workflow';
-import { usePostMessageHandler } from './usePostMessageHandler';
+import { usePostMessageControls, usePostMessageHandler } from './usePostMessageHandler';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
-import type { WorkflowState } from '@/app/composables/useWorkflowState';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { useNotificationsStore } from '@n8n/stores/notifications.store';
+import { useWorkflowExecutionStateStore } from '@/app/stores/workflowExecutionState.store';
+import { createWorkflowDocumentId } from '@/app/stores/workflowDocument.store';
+import { defaultSettings } from '@n8n/frontend-test-utils';
 import type { IExecutionResponse } from '@/features/execution/executions/executions.types';
 
 const mockImportWorkflowExact = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -41,23 +45,25 @@ vi.mock('@/app/composables/useExternalHooks', () => ({
 	})),
 }));
 
-vi.mock('@/app/composables/useTelemetry', () => ({
+vi.mock('@n8n/composables/useTelemetry', () => ({
 	useTelemetry: vi.fn(() => ({
 		track: vi.fn(),
 	})),
 }));
 
-vi.mock('@/app/composables/useToast', () => ({
+const mockToastShowError = vi.hoisted(() => vi.fn());
+const mockToastShowMessage = vi.hoisted(() => vi.fn());
+vi.mock('@n8n/composables/useToast', () => ({
 	useToast: vi.fn(() => ({
-		showError: vi.fn(),
-		showMessage: vi.fn(),
+		showError: mockToastShowError,
+		showMessage: mockToastShowMessage,
 	})),
 }));
 
 const mockFetchAllCredentialsForWorkflow = vi.hoisted(() => vi.fn());
 vi.mock('@/features/credentials/credentials.store', () => ({
 	useCredentialsStore: vi.fn(() => ({
-		fetchAllCredentialsForWorkflow: mockFetchAllCredentialsForWorkflow,
+		fetchUsableCredentials: mockFetchAllCredentialsForWorkflow,
 	})),
 }));
 
@@ -82,6 +88,7 @@ vi.mock('@/features/execution/executions/executions.utils', async (importOrigina
 const mockRoute = vi.hoisted(() => ({
 	name: 'workflow' as string,
 	query: {} as Record<string, string>,
+	params: {} as Record<string, string>,
 }));
 vi.mock('vue-router', async (importOriginal) => {
 	const actual = (await importOriginal()) as object;
@@ -91,23 +98,31 @@ vi.mock('vue-router', async (importOriginal) => {
 	};
 });
 
-function createMockWorkflowState(): WorkflowState {
-	return {
-		setWorkflowExecutionData: vi.fn(),
-	} as unknown as WorkflowState;
+function dispatchPostMessage(payload: Record<string, unknown>) {
+	window.dispatchEvent(
+		new MessageEvent('message', {
+			data: JSON.stringify(payload),
+		}),
+	);
 }
 
 describe('usePostMessageHandler', () => {
-	let workflowState: WorkflowState;
-
 	beforeEach(() => {
 		vi.clearAllMocks();
 		setActivePinia(createTestingPinia());
 		mockIsProductionExecutionPreview.value = false;
 		mockRoute.name = 'workflow';
 		mockRoute.query = {};
-		workflowState = createMockWorkflowState();
+		mockRoute.params = {};
 	});
+
+	// The handler resolves the execution-state store via
+	// `currentWorkflowDocumentStore.value.documentId`. Tests pass a mock document
+	// store whose `documentId` is `createWorkflowDocumentId('')`, so this returns the
+	// same store instance the handler writes to.
+	function getExecutionStateStore() {
+		return useWorkflowExecutionStateStore(createWorkflowDocumentId(''));
+	}
 
 	afterEach(() => {
 		// Ensure listeners are cleaned up
@@ -116,20 +131,20 @@ describe('usePostMessageHandler', () => {
 	describe('setup and cleanup', () => {
 		it('should add message event listener on setup', () => {
 			const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
-			const { setup } = usePostMessageHandler({
-				workflowState,
+			const { setup, cleanup } = usePostMessageHandler({
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 
 			setup();
 
 			expect(addEventListenerSpy).toHaveBeenCalledWith('message', expect.any(Function));
+
+			cleanup();
 		});
 
 		it('should remove message event listener on cleanup', () => {
 			const removeEventListenerSpy = vi.spyOn(window, 'removeEventListener');
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 
@@ -142,7 +157,6 @@ describe('usePostMessageHandler', () => {
 		it('should emit n8nReady postMessage on setup', () => {
 			const postMessageSpy = vi.spyOn(window.parent, 'postMessage');
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 
@@ -159,7 +173,6 @@ describe('usePostMessageHandler', () => {
 		it('should include pushRef in n8nReady postMessage', () => {
 			const postMessageSpy = vi.spyOn(window.parent, 'postMessage');
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 
@@ -174,12 +187,25 @@ describe('usePostMessageHandler', () => {
 
 			cleanup();
 		});
+
+		it('should initialize whether node details can open from the route query', () => {
+			mockRoute.query = { canOpenNDV: 'false' };
+			const { canOpenNDV } = usePostMessageControls();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+
+			setup();
+
+			expect(canOpenNDV.value).toBe(false);
+
+			cleanup();
+		});
 	});
 
 	describe('openWorkflow command', () => {
 		it('should call importWorkflowExact when openWorkflow message is received', async () => {
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -198,11 +224,97 @@ describe('usePostMessageHandler', () => {
 			cleanup();
 		});
 
+		it('should set notification suppression and error allowance from openWorkflow message', async () => {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			const notificationsStore = useNotificationsStore();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+						suppressNotifications: true,
+						allowErrorNotifications: true,
+					}),
+				}),
+			);
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			expect(notificationsStore.areNotificationsSuppressed).toBe(true);
+			expect(notificationsStore.allowErrorNotificationsWhenSuppressed).toBe(true);
+
+			cleanup();
+		});
+
+		it('should clear notification suppression and error allowance when suppression is false', async () => {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			const notificationsStore = useNotificationsStore();
+			notificationsStore.setNotificationsSuppressed(true, { allowErrors: true });
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+						suppressNotifications: false,
+						allowErrorNotifications: true,
+					}),
+				}),
+			);
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			expect(notificationsStore.areNotificationsSuppressed).toBe(false);
+			expect(notificationsStore.allowErrorNotificationsWhenSuppressed).toBe(false);
+
+			cleanup();
+		});
+
+		it('should clear notification suppression and error allowance when suppression is absent', async () => {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			const notificationsStore = useNotificationsStore();
+			notificationsStore.setNotificationsSuppressed(true, { allowErrors: true });
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+					}),
+				}),
+			);
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			expect(notificationsStore.areNotificationsSuppressed).toBe(false);
+			expect(notificationsStore.allowErrorNotificationsWhenSuppressed).toBe(false);
+
+			cleanup();
+		});
+
 		it('should override workflow id to "demo" on demo route when canExecute is not set', async () => {
 			mockRoute.name = 'WorkflowDemo';
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -227,7 +339,6 @@ describe('usePostMessageHandler', () => {
 			mockRoute.query = { canExecute: 'true' };
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -249,7 +360,6 @@ describe('usePostMessageHandler', () => {
 
 		it('should emit tidyUp event when tidyUp is true', async () => {
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -271,6 +381,51 @@ describe('usePostMessageHandler', () => {
 
 			cleanup();
 		});
+
+		it('should set and reset whether node details can open', async () => {
+			const { canOpenNDV } = usePostMessageControls();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			dispatchPostMessage({
+				command: 'openWorkflow',
+				workflow: { nodes: [], connections: {} },
+				canOpenNDV: false,
+			});
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+			expect(canOpenNDV.value).toBe(false);
+
+			cleanup();
+
+			expect(canOpenNDV.value).toBe(true);
+		});
+
+		it('should keep node details disabled when the route query disables them', async () => {
+			mockRoute.query = { canOpenNDV: 'false' };
+			const { canOpenNDV } = usePostMessageControls();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			dispatchPostMessage({
+				command: 'openWorkflow',
+				workflow: { nodes: [], connections: {} },
+				canOpenNDV: true,
+			});
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+			expect(canOpenNDV.value).toBe(false);
+
+			cleanup();
+		});
 	});
 
 	describe('openExecution command', () => {
@@ -282,7 +437,6 @@ describe('usePostMessageHandler', () => {
 			});
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -308,7 +462,7 @@ describe('usePostMessageHandler', () => {
 
 			mockOpenExecution.mockImplementation(async () => {
 				// Simulate what openExecution does: sets workflowId on the store
-				workflowsStore.workflow.id = 'test-wf-id';
+				workflowsStore.workflowId = 'test-wf-id';
 				return {
 					workflowData: { id: 'test-wf-id', name: 'Test' },
 					mode: 'trigger',
@@ -318,7 +472,6 @@ describe('usePostMessageHandler', () => {
 
 			const storeRef = shallowRef(null);
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: storeRef,
 			});
 			setup();
@@ -349,7 +502,6 @@ describe('usePostMessageHandler', () => {
 			});
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -378,7 +530,6 @@ describe('usePostMessageHandler', () => {
 			mockOpenExecution.mockResolvedValue(null);
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -401,6 +552,46 @@ describe('usePostMessageHandler', () => {
 			cleanup();
 		});
 
+		it('should show an error toast when opening execution fails with error allowance enabled', async () => {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			const notificationsStore = useNotificationsStore();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			dispatchPostMessage({
+				command: 'openWorkflow',
+				workflow: { nodes: [], connections: {} },
+				suppressNotifications: true,
+				allowErrorNotifications: true,
+			});
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			expect(notificationsStore.areNotificationsSuppressed).toBe(true);
+			expect(notificationsStore.allowErrorNotificationsWhenSuppressed).toBe(true);
+
+			mockOpenExecution.mockRejectedValueOnce(new Error('Execution could not be opened'));
+			dispatchPostMessage({
+				command: 'openExecution',
+				executionId: 'exec-1',
+				executionMode: 'trigger',
+			});
+
+			await vi.waitFor(() => {
+				expect(mockToastShowMessage).toHaveBeenCalledWith({
+					title: expect.any(String),
+					message: 'Execution could not be opened',
+					type: 'error',
+				});
+			});
+
+			cleanup();
+		});
+
 		it('should not set isProductionExecutionPreview for manual executions', async () => {
 			mockOpenExecution.mockResolvedValue({
 				workflowData: { id: 'w1', name: 'Test' },
@@ -409,7 +600,6 @@ describe('usePostMessageHandler', () => {
 			});
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -436,14 +626,19 @@ describe('usePostMessageHandler', () => {
 	describe('openExecutionPreview command', () => {
 		it('should call importWorkflowExact and set execution data', async () => {
 			const mockSetPinData = vi.fn();
-			const storeRef = shallowRef({ setPinData: mockSetPinData } as never);
+			const storeRef = shallowRef({
+				documentId: createWorkflowDocumentId(''),
+				setPinData: mockSetPinData,
+			} as never);
 			const mockExecutionData = {
 				workflowData: { id: 'w1' },
 			} as unknown as IExecutionResponse;
 			mockBuildExecutionResponseFromSchema.mockReturnValue(mockExecutionData);
 
+			const executionStateStore = getExecutionStateStore();
+			const setWorkflowExecutionDataSpy = vi.spyOn(executionStateStore, 'setWorkflowExecutionData');
+
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: storeRef,
 			});
 			setup();
@@ -462,7 +657,7 @@ describe('usePostMessageHandler', () => {
 				expect(mockImportWorkflowExact).toHaveBeenCalled();
 			});
 
-			expect(workflowState.setWorkflowExecutionData).toHaveBeenCalledWith(mockExecutionData);
+			expect(setWorkflowExecutionDataSpy).toHaveBeenCalledWith(mockExecutionData);
 			expect(mockSetPinData).toHaveBeenCalledWith({});
 
 			cleanup();
@@ -480,10 +675,12 @@ describe('usePostMessageHandler', () => {
 			});
 
 			const mockSetPinData = vi.fn();
-			const storeRef = shallowRef({ setPinData: mockSetPinData } as never);
+			const storeRef = shallowRef({
+				documentId: createWorkflowDocumentId(''),
+				setPinData: mockSetPinData,
+			} as never);
 
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: storeRef,
 			});
 			setup();
@@ -518,7 +715,6 @@ describe('usePostMessageHandler', () => {
 
 		it('should throw if workflow has no nodes', async () => {
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -540,12 +736,68 @@ describe('usePostMessageHandler', () => {
 
 			cleanup();
 		});
+
+		it('should show an error toast when opening execution preview fails with error allowance enabled', async () => {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			const notificationsStore = useNotificationsStore();
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			dispatchPostMessage({
+				command: 'openWorkflow',
+				workflow: { nodes: [], connections: {} },
+				suppressNotifications: true,
+				allowErrorNotifications: true,
+			});
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			expect(notificationsStore.areNotificationsSuppressed).toBe(true);
+			expect(notificationsStore.allowErrorNotificationsWhenSuppressed).toBe(true);
+
+			dispatchPostMessage({
+				command: 'openExecutionPreview',
+				workflow: { connections: {} },
+				nodeExecutionSchema: {},
+				executionStatus: 'success',
+			});
+
+			await vi.waitFor(() => {
+				expect(mockToastShowMessage).toHaveBeenCalledWith({
+					title: expect.any(String),
+					message: 'Invalid workflow object',
+					type: 'error',
+				});
+			});
+
+			cleanup();
+		});
+	});
+
+	describe('fitView command', () => {
+		it('should emit fitView on canvasEventBus when fitView message is received', async () => {
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			dispatchPostMessage({ command: 'fitView' });
+
+			await vi.waitFor(() => {
+				expect(mockCanvasEventBusEmit).toHaveBeenCalledWith('fitView');
+			});
+
+			cleanup();
+		});
 	});
 
 	describe('message filtering', () => {
 		it('should ignore non-string messages', async () => {
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -562,7 +814,6 @@ describe('usePostMessageHandler', () => {
 
 		it('should ignore messages without "command" in data', async () => {
 			const { setup, cleanup } = usePostMessageHandler({
-				workflowState,
 				currentWorkflowDocumentStore: shallowRef(null),
 			});
 			setup();
@@ -571,6 +822,90 @@ describe('usePostMessageHandler', () => {
 				data: JSON.stringify({ action: 'something' }),
 			});
 			window.dispatchEvent(messageEvent);
+
+			await new Promise((r) => setTimeout(r, 10));
+			expect(mockImportWorkflowExact).not.toHaveBeenCalled();
+
+			cleanup();
+		});
+	});
+
+	describe('origin filtering', () => {
+		function setAllowedOrigins(origins: string[]) {
+			setActivePinia(createTestingPinia({ stubActions: false }));
+			useSettingsStore().setSettings({
+				...defaultSettings,
+				security: {
+					blockFileAccessToN8nFiles: false,
+					postMessageAllowedOrigins: origins,
+				},
+			});
+		}
+
+		it('should process commands from any origin when no allowlist is configured', async () => {
+			setAllowedOrigins([]);
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+					}),
+					origin: 'https://external.example',
+				}),
+			);
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			cleanup();
+		});
+
+		it('should process commands from an allowed origin', async () => {
+			setAllowedOrigins(['https://trusted.example']);
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+					}),
+					origin: 'https://trusted.example',
+				}),
+			);
+
+			await vi.waitFor(() => {
+				expect(mockImportWorkflowExact).toHaveBeenCalled();
+			});
+
+			cleanup();
+		});
+
+		it('should ignore commands from an origin outside the allowlist', async () => {
+			setAllowedOrigins(['https://trusted.example']);
+			const { setup, cleanup } = usePostMessageHandler({
+				currentWorkflowDocumentStore: shallowRef(null),
+			});
+			setup();
+
+			window.dispatchEvent(
+				new MessageEvent('message', {
+					data: JSON.stringify({
+						command: 'openWorkflow',
+						workflow: { nodes: [], connections: {} },
+					}),
+					origin: 'https://untrusted.example',
+				}),
+			);
 
 			await new Promise((r) => setTimeout(r, 10));
 			expect(mockImportWorkflowExact).not.toHaveBeenCalled();

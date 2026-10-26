@@ -10,14 +10,18 @@ import {
 	type SupplyData,
 } from 'n8n-workflow';
 
-import { checkDomainRestrictions } from '@utils/checkDomainRestrictions';
-import { mergeCustomHeaders } from '@utils/helpers';
+import { wrapChatModelMessageInput } from '@utils/chatModelMessageWrapper';
+import { getCustomCredentialHeader, mergeCustomHeaders } from '@utils/helpers';
+import { MODEL_SELECTION_HINT } from '@utils/model-builder-hints';
 
+import { parseExtraBody } from '../shared/extra-body';
+import { assertOpenAiCredentialAllowsUrl } from '../../vendors/OpenAi/helpers/credentials';
 import { openAiFailedAttemptHandler } from '../../vendors/OpenAi/helpers/error-handling';
 import {
 	makeN8nLlmFailedAttemptHandler,
 	N8nLlmTracing,
 	getProxyAgent,
+	aiClientFetch,
 	getConnectionHintNoticeField,
 } from '@n8n/ai-utilities';
 import { formatBuiltInTools, prepareAdditionalResponsesParams } from './common';
@@ -35,8 +39,7 @@ const INCLUDE_JSON_WARNING: INodeProperties = {
 };
 
 const OPENAI_MODEL_BUILDER_HINT = {
-	message:
-		'Prefer the GPT-5.4 family: the flagship variant (e.g. `gpt-5.4`) for general use, a `-mini` / `-nano` variant when the task explicitly calls for cost-efficiency, or `-pro` only when the user asks for maximum capability. Never use gpt-4o, gpt-4-turbo, gpt-4, gpt-3.5, or earlier — those are superseded by the GPT-5 family and are not valid choices.',
+	propertyHint: MODEL_SELECTION_HINT,
 };
 
 const completionsResponseFormat: INodeProperties = {
@@ -141,7 +144,7 @@ export class LmChatOpenAi implements INodeType {
 				name: 'model',
 				type: 'options',
 				description:
-					'The model which will generate the completion. <a href="https://beta.openai.com/docs/models/overview">Learn more</a>.',
+					'The model which will generate the completion. <a href="https://developers.openai.com/api/docs/models">Learn more</a>.',
 				typeOptions: {
 					loadOptions: {
 						routing: {
@@ -599,6 +602,14 @@ export class LmChatOpenAi implements INodeType {
 						type: 'number',
 					},
 					{
+						displayName: 'Extra Body',
+						name: 'extraBody',
+						type: 'json',
+						default: '{}',
+						description:
+							'Optional additional JSON properties to include in the request body when making requests to OpenAI-compatible APIs',
+					},
+					{
 						displayName: 'Conversation ID',
 						name: 'conversationId',
 						default: '',
@@ -755,11 +766,12 @@ export class LmChatOpenAi implements INodeType {
 		const { openAiDefaultHeaders: defaultHeaders } = Container.get(AiConfig);
 
 		const configuration: ClientOptions = {
+			fetch: aiClientFetch,
 			defaultHeaders,
 		};
 
 		if (options.baseURL) {
-			checkDomainRestrictions(this, credentials, options.baseURL);
+			assertOpenAiCredentialAllowsUrl(this.getNode(), credentials, options.baseURL);
 			configuration.baseURL = options.baseURL;
 		} else if (credentials.url) {
 			configuration.baseURL = credentials.url as string;
@@ -767,11 +779,16 @@ export class LmChatOpenAi implements INodeType {
 
 		const timeout = options.timeout;
 		configuration.fetchOptions = {
-			dispatcher: getProxyAgent(configuration.baseURL ?? 'https://api.openai.com/v1', {
-				headersTimeout: timeout,
-				bodyTimeout: timeout,
-			}),
+			dispatcher: getProxyAgent(
+				configuration.baseURL ?? 'https://api.openai.com/v1',
+				{
+					headersTimeout: timeout,
+					bodyTimeout: timeout,
+				},
+				this.helpers.getSecureEgressFilter(),
+			),
 		};
+		const customHeader = getCustomCredentialHeader(credentials);
 		configuration.defaultHeaders = mergeCustomHeaders(
 			credentials,
 			(configuration.defaultHeaders ?? {}) as Record<string, string>,
@@ -787,6 +804,10 @@ export class LmChatOpenAi implements INodeType {
 			if (options.reasoningEffort && ['low', 'medium', 'high'].includes(options.reasoningEffort)) {
 				modelKwargs.reasoning_effort = options.reasoningEffort;
 			}
+		}
+
+		if (options.extraBody) {
+			Object.assign(modelKwargs, parseExtraBody(this, options.extraBody, itemIndex));
 		}
 
 		const includedOptions = pick(options, [
@@ -805,7 +826,9 @@ export class LmChatOpenAi implements INodeType {
 			timeout,
 			maxRetries: options.maxRetries ?? 2,
 			configuration,
-			callbacks: [new N8nLlmTracing(this)],
+			callbacks: [
+				new N8nLlmTracing(this, { redactedHeaders: customHeader ? [customHeader.name] : [] }),
+			],
 			modelKwargs,
 			onFailedAttempt: makeN8nLlmFailedAttemptHandler(this, openAiFailedAttemptHandler),
 			// Set to false to ensure compatibility with OpenAI-compatible backends (LM Studio, vLLM, etc.)
@@ -834,7 +857,7 @@ export class LmChatOpenAi implements INodeType {
 		}
 
 		return {
-			response: model,
+			response: responsesApiEnabled ? model : wrapChatModelMessageInput(model),
 		};
 	}
 }

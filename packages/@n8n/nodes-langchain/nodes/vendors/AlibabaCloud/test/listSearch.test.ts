@@ -1,8 +1,8 @@
-import { mock } from 'jest-mock-extended';
 import type { ILoadOptionsFunctions } from 'n8n-workflow';
+import { mock } from 'vitest-mock-extended';
 
-jest.mock('../transport', () => ({
-	apiRequest: jest.fn(),
+vi.mock('../transport', () => ({
+	apiRequest: vi.fn(),
 }));
 
 import {
@@ -14,7 +14,9 @@ import {
 } from '../methods/listSearch';
 import { apiRequest } from '../transport';
 
-const mockApiRequest = apiRequest as jest.Mock;
+import type { Mock } from 'vitest';
+
+const mockApiRequest = apiRequest as Mock;
 
 describe('AlibabaCloud listSearch', () => {
 	let mockLoadOptionsFunctions: ReturnType<typeof mock<ILoadOptionsFunctions>>;
@@ -24,7 +26,7 @@ describe('AlibabaCloud listSearch', () => {
 	});
 
 	afterEach(() => {
-		jest.clearAllMocks();
+		vi.clearAllMocks();
 	});
 
 	const setupMockModels = (models: string[]) => {
@@ -43,6 +45,8 @@ describe('AlibabaCloud listSearch', () => {
 		'qwen-image',
 		'qwen-image-plus',
 		'wan2.6-t2i',
+		'wan2.5-t2i-preview',
+		'wan2.5-i2i-preview',
 		'z-image-turbo',
 		'wan2.6-t2v',
 		'wan2.6-i2v',
@@ -67,6 +71,7 @@ describe('AlibabaCloud listSearch', () => {
 			expect(values).not.toContain('qwen-image');
 			expect(values).not.toContain('wan2.6-t2v');
 			expect(values).not.toContain('wan2.6-i2v');
+			expect(values).not.toContain('wan2.5-i2i-preview');
 		});
 
 		it('should apply search filter', async () => {
@@ -105,6 +110,8 @@ describe('AlibabaCloud listSearch', () => {
 			expect(values).toContain('qwen-image');
 			expect(values).toContain('qwen-image-plus');
 			expect(values).toContain('wan2.6-t2i');
+			expect(values).toContain('wan2.5-t2i-preview');
+			expect(values).toContain('wan2.5-i2i-preview');
 			expect(values).not.toContain('qwen3.5-flash');
 			expect(values).not.toContain('wan2.6-t2v');
 		});

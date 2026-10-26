@@ -6,9 +6,10 @@ import { useAvailableProjectSearch } from '../projects.utils';
 import type { ProjectSearchFn } from '../projects.utils';
 import { useI18n } from '@n8n/i18n';
 import type { ResourceCounts } from '../projects.store';
+import { APP_MODALS_ELEMENT_ID } from '@/app/constants';
 
 import { ElDialog, ElRadio } from 'element-plus';
-import { N8nButton, N8nInput, N8nInputLabel, N8nText } from '@n8n/design-system';
+import { N8nButton, N8nDialogFooter, N8nInput, N8nInputLabel, N8nText } from '@n8n/design-system';
 type Props = {
 	currentProject: Project | null;
 	searchFn?: ProjectSearchFn;
@@ -69,6 +70,7 @@ const onDelete = () => {
 			})
 		"
 		width="650"
+		:append-to="`#${APP_MODALS_ELEMENT_ID}`"
 	>
 		<N8nText v-if="!hasMovableResources" color="text-base">{{
 			locale.baseText('projects.settings.delete.message.empty')
@@ -121,14 +123,16 @@ const onDelete = () => {
 			</div>
 		</div>
 		<template #footer>
-			<N8nButton
-				variant="destructive"
-				type="button"
-				:disabled="!isValid"
-				data-test-id="project-settings-delete-confirm-button"
-				@click.stop.prevent="onDelete"
-				>{{ locale.baseText('projects.settings.danger.deleteProject') }}</N8nButton
-			>
+			<N8nDialogFooter>
+				<N8nButton
+					variant="destructive"
+					type="button"
+					:disabled="!isValid"
+					data-test-id="project-settings-delete-confirm-button"
+					@click.stop.prevent="onDelete"
+					>{{ locale.baseText('projects.settings.danger.deleteProject') }}</N8nButton
+				>
+			</N8nDialogFooter>
 		</template>
 	</ElDialog>
 </template>

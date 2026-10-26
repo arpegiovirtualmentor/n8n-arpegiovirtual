@@ -2,87 +2,233 @@ import { Logger } from '@n8n/backend-common';
 import type { ModuleInterface } from '@n8n/decorators';
 import { BackendModule, OnShutdown } from '@n8n/decorators';
 import { Container } from '@n8n/di';
+import { InstanceSettings } from 'n8n-core';
 
-const YELLOW = '\x1b[33m';
-const CLEAR = '\x1b[0m';
-const WARNING_MESSAGE =
-	"[Instance AI] 'instance-ai' module is experimental, undocumented and subject to change. " +
-	'Before its official release any features may become inaccessible at any point, ' +
-	'and using the module could compromise the stability of your system. Use at your own risk!';
-
-@BackendModule({ name: 'instance-ai', instanceTypes: ['main'] })
+@BackendModule({ name: 'instance-ai', instanceTypes: ['main', 'worker', 'webhook'] })
 export class InstanceAiModule implements ModuleInterface {
+	private isMain(): boolean {
+		return Container.get(InstanceSettings).instanceType === 'main';
+	}
+
 	async init() {
-		const logger = Container.get(Logger).scoped('instance-ai');
-		logger.warn(`${YELLOW}${WARNING_MESSAGE}${CLEAR}`);
+		await import('./self-healing/self-healing-trigger.service.js');
 
-		const { InstanceAiSettingsService } = await import('./instance-ai-settings.service');
-		await Container.get(InstanceAiSettingsService).loadFromDb();
-		await import('./instance-ai.controller');
+		// Workers and webhook processes only relay eligible failures to main.
+		if (!this.isMain()) return;
 
-		if (process.env.E2E_TESTS === 'true' && process.env.NODE_ENV !== 'production') {
-			await import('./instance-ai-test.controller');
+		const { WorkflowMutationHooksProxy } = await import('@n8n/backend-services');
+		const { SelfHealingConfigurationService } = await import(
+			'./self-healing/self-healing-configuration.service.js'
+		);
+
+		// Clean up selections after transfers even when self-healing is disabled.
+		Container.get(WorkflowMutationHooksProxy).registerProvider(
+			Container.get(SelfHealingConfigurationService),
+		);
+
+		const { InstanceCredentialBroker } = await import(
+			'@/credentials/instance-credential-broker.js'
+		);
+		const {
+			InstanceAiSettingsService,
+			INSTANCE_AI_MODEL_CREDENTIAL_POLICY,
+			INSTANCE_AI_SEARCH_CREDENTIAL_POLICY,
+		} = await import('./instance-ai-settings.service.js');
+		const { SandboxSettingsService } = await import('@/services/sandbox-settings.service.js');
+		const settingsService = Container.get(InstanceAiSettingsService);
+		const credentialBroker = Container.get(InstanceCredentialBroker);
+		credentialBroker.registerUse(INSTANCE_AI_MODEL_CREDENTIAL_POLICY);
+		Container.get(SandboxSettingsService).registerCredentialUses();
+		credentialBroker.registerUse(INSTANCE_AI_SEARCH_CREDENTIAL_POLICY);
+		await settingsService.loadFromDb();
+		// Instantiating the setup telemetry service registers its settings-updated
+		// listener. A setup finished by env vars only becomes observable at boot,
+		// so the once-per-instance completion telemetry is also checked here.
+		const { InstanceAiSetupTelemetryService } = await import(
+			'./instance-ai-setup-telemetry.service.js'
+		);
+		await Container.get(InstanceAiSetupTelemetryService).recordSetupCompletedIfNeeded();
+		await import('./instance-ai.controller.js');
+		await import('./mcp/instance-ai-mcp-connection.controller.js');
+		const { InstanceAiConfig } = await import('@n8n/config');
+		if (Container.get(InstanceAiConfig).evalInstance) {
+			await import('./eval/eval.controller.js');
+		}
+		if (Container.get(InstanceAiConfig).workflowSuggestionsEnabled) {
+			await import('./self-healing/self-healing-results.controller.js');
+			await import('./self-healing/self-healing-configurations.controller.js');
+			const { InboxSourceRegistry } = await import('../inbox/inbox-source.registry.js');
+			const { SelfHealingResultService } = await import(
+				'./self-healing/self-healing-result.service.js'
+			);
+			const results = Container.get(SelfHealingResultService);
+			Container.get(InboxSourceRegistry).register({
+				type: 'self_healing_result',
+				isEnabled: async () => Container.get(InstanceAiConfig).workflowSuggestionsEnabled,
+				list: async (user, query) => await results.listForInbox(user, query),
+				count: async (user) => await results.countForInbox(user),
+			});
+			const { WorkflowSuggestionEventRelay } = await import(
+				'./workflow-suggestions/workflow-suggestion-event-relay.service.js'
+			);
+			Container.get(WorkflowMutationHooksProxy).registerProvider(
+				Container.get(WorkflowSuggestionEventRelay),
+			);
 		}
 
-		// Fire-and-forget: clean up expired conversation threads on startup
-		const { InstanceAiMemoryService } = await import('./instance-ai-memory.service');
-		const { InstanceAiService } = await import('./instance-ai.service');
-		const aiService = Container.get(InstanceAiService);
-		void Container.get(InstanceAiMemoryService)
-			.cleanupExpiredThreads(async (threadId) => await aiService.clearThreadState(threadId))
-			.catch(() => undefined);
+		// Instantiating the relay registers its `user-deleted` listener, which
+		// cleans up Instance AI data owned by the deleted user.
+		const { InstanceAiEventRelay } = await import('./instance-ai-event-relay.service.js');
+		Container.get(InstanceAiEventRelay);
 
-		// Initialize snapshot pruning — lifecycle decorators handle multi-main start/stop
-		const { SnapshotPruningService } = await import('./snapshot-pruning.service');
-		Container.get(SnapshotPruningService).init();
+		void this.reconcileInterruptedRuns().catch((error: unknown) => {
+			Container.get(Logger)
+				.scoped('instance-ai')
+				.error('Startup run reconciliation failed', { error });
+		});
+
+		if (process.env.E2E_TESTS === 'true' && process.env.NODE_ENV !== 'production') {
+			await import('./instance-ai-test.controller.js');
+		}
+	}
+
+	private async reconcileInterruptedRuns(): Promise<void> {
+		const { InterruptedRunSweeper } = await import('./event-bus/interrupted-run-sweeper.js');
+		const { InstanceAiService } = await import('./instance-ai.service.js');
+		const { SelfHealingInvestigationService } = await import(
+			'./self-healing/self-healing-investigation.service.js'
+		);
+		const sweeper = Container.get(InterruptedRunSweeper);
+		sweeper.setResumeHost(Container.get(InstanceAiService));
+
+		await sweeper.sweep();
+		await Container.get(SelfHealingInvestigationService).reconcile();
+	}
+
+	async systemTasks() {
+		if (!this.isMain()) return [];
+
+		const { InstanceAiConfig } = await import('@n8n/config');
+		const { SelfHealingReconciliationTask } = await import(
+			'./self-healing/self-healing-reconciliation.task.js'
+		);
+		if (Container.get(InstanceAiConfig).pruneInterval <= 0) return [SelfHealingReconciliationTask];
+
+		const { InstanceAiCheckpointPruningTask } = await import(
+			'./instance-ai-checkpoint-pruning.task.js'
+		);
+		return [InstanceAiCheckpointPruningTask, SelfHealingReconciliationTask];
 	}
 
 	async settings() {
+		if (!this.isMain()) return {};
+
 		const { GlobalConfig } = await import('@n8n/config');
-		const { InstanceAiService } = await import('./instance-ai.service');
-		const { InstanceAiSettingsService } = await import('./instance-ai-settings.service');
+		const { InstanceAiService } = await import('./instance-ai.service.js');
+		const { InstanceAiSettingsService } = await import('./instance-ai-settings.service.js');
 		const globalConfig = Container.get(GlobalConfig);
 		const service = Container.get(InstanceAiService);
 		const settingsService = Container.get(InstanceAiSettingsService);
-		const enabled = service.isEnabled();
-		const localGatewayDisabled = settingsService.isLocalGatewayDisabled();
-		const optinModalDismissed = settingsService.getAdminSettings().optinModalDismissed;
+		const enabled = settingsService.isAgentEnabled();
+		const mcpConnectionsAvailable = service.areMcpConnectionsAvailable();
+		const browserUseEnabled = settingsService.isBrowserUseEnabled();
+		const sandboxStatus = settingsService.getSandboxStatus();
+		const setupCompleted = await settingsService.isSetupCompleted();
 		return {
 			enabled,
-			localGatewayDisabled,
+			mcpConnectionsAvailable,
+			browserUseEnabled,
 			proxyEnabled: service.isProxyEnabled(),
-			optinModalDismissed,
 			cloudManaged: globalConfig.deployment.type === 'cloud',
+			setupCompleted,
+			sandboxEnabled: sandboxStatus.enabled,
+			workflowBuilderAvailable: enabled && sandboxStatus.workflowBuilderAvailable,
+			sandboxUnavailableReason: sandboxStatus.unavailableReason,
+			runDebugEnabled: globalConfig.instanceAi.runDebugEnabled,
+			workflowSuggestionsEnabled: globalConfig.instanceAi.workflowSuggestionsEnabled,
 		};
 	}
 
 	async entities() {
-		const { InstanceAiThread } = await import('./entities/instance-ai-thread.entity');
-		const { InstanceAiMessage } = await import('./entities/instance-ai-message.entity');
-		const { InstanceAiResource } = await import('./entities/instance-ai-resource.entity');
-		const { InstanceAiObservationalMemory } = await import(
-			'./entities/instance-ai-observational-memory.entity'
+		const { InstanceAiThread } = await import('./entities/instance-ai-thread.entity.js');
+		const { InstanceAiMessage } = await import('./entities/instance-ai-message.entity.js');
+		const { InstanceAiResource } = await import('./entities/instance-ai-resource.entity.js');
+		const { InstanceAiIterationLog } = await import(
+			'./entities/instance-ai-iteration-log.entity.js'
 		);
-		const { InstanceAiWorkflowSnapshot } = await import(
-			'./entities/instance-ai-workflow-snapshot.entity'
+		const { InstanceAiCheckpoint } = await import('./entities/instance-ai-checkpoint.entity.js');
+		const { InstanceAiPendingConfirmation } = await import(
+			'./entities/instance-ai-pending-confirmation.entity.js'
 		);
-		const { InstanceAiRunSnapshot } = await import('./entities/instance-ai-run-snapshot.entity');
-		const { InstanceAiIterationLog } = await import('./entities/instance-ai-iteration-log.entity');
+		const { InstanceAiObservation } = await import('./entities/instance-ai-observation.entity.js');
+		const { InstanceAiObservationCursor } = await import(
+			'./entities/instance-ai-observation-cursor.entity.js'
+		);
+		const { InstanceAiObservationLock } = await import(
+			'./entities/instance-ai-observation-lock.entity.js'
+		);
+		const { InstanceAiMcpRegistryConnection } = await import(
+			'./entities/instance-ai-mcp-registry-connection.entity.js'
+		);
+		const { InstanceAiThreadGrant } = await import('./entities/instance-ai-thread-grant.entity.js');
+		const { InstanceAiThreadTabs } = await import('./entities/instance-ai-thread-tabs.entity.js');
+		const { InstanceAiEventLogEntry } = await import(
+			'./entities/instance-ai-event-log-entry.entity.js'
+		);
+		const { WorkflowSuggestion } = await import(
+			'./workflow-suggestions/database/workflow-suggestion.entity.js'
+		);
+		const { WorkflowSuggestionActivity } = await import(
+			'./workflow-suggestions/database/workflow-suggestion-activity.entity.js'
+		);
+		const { SelfHealingResult } = await import(
+			'./self-healing/database/self-healing-result.entity.js'
+		);
+		const { SelfHealingInvestigation } = await import(
+			'./self-healing/database/self-healing-investigation.entity.js'
+		);
+
+		const { SelfHealingConfiguration } = await import(
+			'./self-healing/database/self-healing-configuration.entity.js'
+		);
+
+		const { SelfHealingConfigurationWorkflow } = await import(
+			'./self-healing/database/self-healing-configuration-workflow.entity.js'
+		);
+
+		const { SelfHealingConfigurationReviewer } = await import(
+			'./self-healing/database/self-healing-configuration-reviewer.entity.js'
+		);
 
 		return [
 			InstanceAiThread,
 			InstanceAiMessage,
 			InstanceAiResource,
-			InstanceAiObservationalMemory,
-			InstanceAiWorkflowSnapshot,
-			InstanceAiRunSnapshot,
 			InstanceAiIterationLog,
+			InstanceAiCheckpoint,
+			InstanceAiPendingConfirmation,
+			InstanceAiObservation,
+			InstanceAiObservationCursor,
+			InstanceAiObservationLock,
+			InstanceAiMcpRegistryConnection,
+			InstanceAiThreadGrant,
+			InstanceAiThreadTabs,
+			InstanceAiEventLogEntry,
+			WorkflowSuggestion,
+			WorkflowSuggestionActivity,
+			SelfHealingResult,
+			SelfHealingInvestigation,
+			SelfHealingConfigurationReviewer,
+			SelfHealingConfigurationWorkflow,
+			SelfHealingConfiguration,
 		];
 	}
 
 	@OnShutdown()
 	async shutdown() {
-		const { InstanceAiService } = await import('./instance-ai.service');
+		if (!this.isMain()) return;
+
+		const { InstanceAiService } = await import('./instance-ai.service.js');
 		await Container.get(InstanceAiService).shutdown();
 	}
 }

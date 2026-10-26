@@ -1,22 +1,29 @@
+import {
+	describeInstallPolicyNote,
+	describeSelectedNodeRestriction,
+	isNodesApiVersionError,
+} from '../communityNodes.utils';
 import { useCommunityNodesStore } from '../communityNodes.store';
 import { useCredentialsStore } from '@/features/credentials/credentials.store';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
-import { useUsersStore } from '@/features/settings/users/users.store';
-import { computed, nextTick, ref } from 'vue';
+import { useUsersStore } from '@n8n/stores/users.store';
+import { nextTick, ref } from 'vue';
 import { i18n } from '@n8n/i18n';
-import { useToast } from '@/app/composables/useToast';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
-import {
-	useWorkflowDocumentStore,
-	createWorkflowDocumentId,
-} from '@/app/stores/workflowDocument.store';
+import { useToast } from '@n8n/composables/useToast';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 import { useCanvasOperations } from '@/app/composables/useCanvasOperations';
-import { removePreviewToken } from '@/features/shared/nodeCreator/nodeCreator.utils';
-import { useTelemetry } from '@/app/composables/useTelemetry';
-import { useSettingsStore } from '@/app/stores/settings.store';
+import {
+	getNodeItemRestriction,
+	removePreviewToken,
+} from '@/features/shared/nodeCreator/nodeCreator.utils';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { useTypeAvailabilityPoliciesStore } from '@n8n/frontend-module-type-availability-policies';
 
 type InstallNodeProps = {
 	type: 'verified' | 'unverified';
+	/** The node type the caller adds right after the install, such as a Tool variant. */
+	selectedNodeType?: string;
 	telemetry?: {
 		hasQuickConnect: boolean;
 		source: string;
@@ -37,22 +44,22 @@ type InstallNodeProps = {
 type InstallNodeResult = {
 	success: boolean;
 	error?: Error;
+	/** A policy restricts `selectedNodeType`. The install toast already said so. */
+	restricted?: boolean;
 };
 
 export function useInstallNode() {
 	const communityNodesStore = useCommunityNodesStore();
 	const nodeTypesStore = useNodeTypesStore();
 	const credentialsStore = useCredentialsStore();
-	const workflowsStore = useWorkflowsStore();
-	const workflowDocumentStore = computed(() =>
-		useWorkflowDocumentStore(createWorkflowDocumentId(workflowsStore.workflowId)),
-	);
+	const workflowDocumentStore = injectWorkflowDocumentStore();
 	const userStore = useUsersStore();
 	const loading = ref(false);
 	const toast = useToast();
 	const canvasOperations = useCanvasOperations();
 	const telemetry = useTelemetry();
 	const settingsStore = useSettingsStore();
+	const typeAvailabilityPoliciesStore = useTypeAvailabilityPoliciesStore();
 
 	const getNpmVersion = async (key: string) => {
 		const communityNodeAttributes = await nodeTypesStore.getCommunityNodeAttributes(key);
@@ -62,6 +69,15 @@ export function useInstallNode() {
 		}
 
 		return undefined;
+	};
+
+	/** `undefined` when no policy restricts the node in the current project. */
+	const describeSelectedNode = (nodeTypeName: string) => {
+		const restriction = getNodeItemRestriction(nodeTypeName);
+		if (!restriction) return undefined;
+
+		const displayName = nodeTypesStore.getNodeType(nodeTypeName)?.displayName ?? nodeTypeName;
+		return describeSelectedNodeRestriction(displayName, restriction.scope);
 	};
 
 	const installNode = async (props: InstallNodeProps): Promise<InstallNodeResult> => {
@@ -81,21 +97,20 @@ export function useInstallNode() {
 
 		try {
 			loading.value = true;
-			if (props.type === 'verified' && !settingsStore.isUnverifiedPackagesEnabled) {
-				await communityNodesStore.installPackage(
-					props.packageName,
-					true,
-					await getNpmVersion(props.nodeType),
-				);
-			} else {
-				await communityNodesStore.installPackage(props.packageName);
-			}
+			const installedPackage =
+				props.type === 'verified' && !settingsStore.isUnverifiedPackagesEnabled
+					? await communityNodesStore.installPackage(
+							props.packageName,
+							await getNpmVersion(props.nodeType),
+						)
+					: await communityNodesStore.installPackage(props.packageName);
 
 			// refresh store information about installed nodes
 			await Promise.all([
 				nodeTypesStore.getNodeTypes(),
 				nodeTypesStore.fetchCommunityNodePreviews(),
 				credentialsStore.fetchCredentialTypes(true),
+				typeAvailabilityPoliciesStore.reload(),
 			]);
 			await nextTick();
 
@@ -107,13 +122,29 @@ export function useInstallNode() {
 				const nodesToUpdate = allNodes.filter((node) => node.type === removePreviewToken(nodeType));
 				canvasOperations.initializeUnknownNodes(nodesToUpdate);
 			}
+			const selectedNote = props.selectedNodeType
+				? describeSelectedNode(removePreviewToken(props.selectedNodeType))
+				: undefined;
+			const policyNote =
+				selectedNote ??
+				describeInstallPolicyNote(
+					installedPackage.policyRestrictions,
+					installedPackage.installedNodes.length,
+				);
 			toast.showMessage({
 				title: i18n.baseText('settings.communityNodes.messages.install.success'),
-				type: 'success',
+				...(policyNote ? { type: 'warning', message: policyNote } : { type: 'success' }),
 			});
-			return { success: true };
+			return { success: true, restricted: selectedNote !== undefined };
 		} catch (error) {
-			toast.showError(error, i18n.baseText('settings.communityNodes.messages.install.error'));
+			toast.showError(
+				error,
+				i18n.baseText(
+					isNodesApiVersionError(error)
+						? 'settings.communityNodes.messages.install.incompatible.title'
+						: 'settings.communityNodes.messages.install.error',
+				),
+			);
 			return { success: false, error };
 		} finally {
 			loading.value = false;
